@@ -1,16 +1,16 @@
 package com.pos.inconsistency.service;
 
-import com.fasterxml.jackson.databind.ObjectMapper;
+import com.newrelic.telemetry.Attributes;
+import com.newrelic.telemetry.OkHttpPoster;
+import com.newrelic.telemetry.SenderConfiguration;
+import com.newrelic.telemetry.events.Event;
+import com.newrelic.telemetry.events.EventBatch;
+import com.newrelic.telemetry.events.EventBatchSender;
 import com.pos.inconsistency.model.MtsStore;
 import com.pos.inconsistency.model.MtsSummary;
 import com.pos.inconsistency.model.PosStatus;
 import io.micronaut.context.annotation.Value;
-import io.micronaut.http.HttpRequest;
-import io.micronaut.http.HttpResponse;
-import io.micronaut.http.MediaType;
-import io.micronaut.http.client.HttpClient;
-import io.micronaut.http.client.annotation.Client;
-import jakarta.inject.Inject;
+import jakarta.annotation.PostConstruct;
 import jakarta.inject.Singleton;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -23,12 +23,12 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * Fire-and-forget service that emits custom events to the New Relic Insights Events API.
+ * Fire-and-forget service that emits custom events to New Relic via the Telemetry SDK.
  *
  * All public methods catch all exceptions internally and log warnings — they never throw.
  * This ensures that NR telemetry failures never disrupt the core tracking logic.
  *
- * Event batches are capped at 2000 events per POST, which is the NR Insights API limit.
+ * Event batches are capped at 2000 events per send, which is the NR Insights API limit.
  */
 @Singleton
 public class NewRelicEmitService {
@@ -37,7 +37,6 @@ public class NewRelicEmitService {
 
     private static final int NR_BATCH_LIMIT = 2000;
 
-    // Known POS statuses used when building PosTrackingResult events
     private static final String STATUS_DELIVERED_NO_ACK = "DELIVERED_NO_ACK";
     private static final String STATUS_FAILED           = "FAILED";
     private static final String STATUS_MISSING          = "MISSING";
@@ -45,16 +44,20 @@ public class NewRelicEmitService {
     @Value("${newrelic.api-key}")
     private String apiKey;
 
-    @Value("${newrelic.events-url}")
-    private String eventsUrl;
+    @Value("${newrelic.account-id}")
+    private String accountId;
 
-    private final HttpClient httpClient;
-    private final ObjectMapper objectMapper;
+    private EventBatchSender eventBatchSender;
 
-    @Inject
-    public NewRelicEmitService(@Client HttpClient httpClient, ObjectMapper objectMapper) {
-        this.httpClient = httpClient;
-        this.objectMapper = objectMapper;
+    @PostConstruct
+    void init() {
+        SenderConfiguration config = SenderConfiguration
+                .builder("insights-collector.newrelic.com",
+                        "/v1/accounts/" + accountId + "/events")
+                .apiKey(apiKey)
+                .httpPoster(new OkHttpPoster())
+                .build();
+        eventBatchSender = EventBatchSender.create(config);
     }
 
     // -----------------------------------------------------------------------
@@ -62,41 +65,37 @@ public class NewRelicEmitService {
     // -----------------------------------------------------------------------
 
     /**
-     * Emits a {@code MessageTrackingResult} event to NR representing the final
-     * outcome of a fully-tracked message.
+     * Emits a {@code MessageTrackingResult} event representing the final outcome of a
+     * fully-tracked message.
      *
      * @param summary               the finalized summary row
      * @param storeFinalizationTimes map of storeNumber -&gt; finalization timestamp
-     *                               (may be empty; included as metadata)
      */
     public void emitMessageTrackingResult(MtsSummary summary,
                                            Map<String, Instant> storeFinalizationTimes) {
         try {
-            Map<String, Object> event = new LinkedHashMap<>();
-            event.put("eventType", "MessageTrackingResult");
-            event.put("messageKey", summary.getMessageKey());
-            event.put("clusterId", summary.getClusterId());
-            event.put("msgOffset", summary.getMsgOffset());
-            event.put("state", summary.getState());
-            event.put("totalStores", summary.getTotalStores());
-            event.put("storesDone", summary.getStoresDone());
-            event.put("storesPartial", summary.getStoresPartial());
-            event.put("storesTimedOut", summary.getStoresTimedOut());
-            event.put("publishCount", summary.getPublishCount());
-            event.put("inconsistencyCount", summary.getInconsistencies().size());
-            event.put("inconsistencies", String.join(",", summary.getInconsistencies()));
-            event.put("firstPublishedAt", toEpochMillis(summary.getFirstPublishedAt()));
-            event.put("lastPublishedAt", toEpochMillis(summary.getLastPublishedAt()));
-            event.put("expireAt", toEpochMillis(summary.getExpireAt()));
-            event.put("trackingDurationMs", computeTrackingDuration(summary));
-            event.put("timestamp", System.currentTimeMillis());
+            Map<String, Object> attrs = new LinkedHashMap<>();
+            attrs.put("messageKey", summary.getMessageKey());
+            attrs.put("clusterId", summary.getClusterId());
+            attrs.put("msgOffset", summary.getMsgOffset());
+            attrs.put("state", summary.getState());
+            attrs.put("totalStores", summary.getTotalStores());
+            attrs.put("storesDone", summary.getStoresDone());
+            attrs.put("storesPartial", summary.getStoresPartial());
+            attrs.put("storesTimedOut", summary.getStoresTimedOut());
+            attrs.put("publishCount", summary.getPublishCount());
+            attrs.put("inconsistencyCount", summary.getInconsistencies().size());
+            attrs.put("inconsistencies", String.join(",", summary.getInconsistencies()));
+            attrs.put("firstPublishedAt", toEpochMillis(summary.getFirstPublishedAt()));
+            attrs.put("lastPublishedAt", toEpochMillis(summary.getLastPublishedAt()));
+            attrs.put("expireAt", toEpochMillis(summary.getExpireAt()));
+            attrs.put("trackingDurationMs", computeTrackingDuration(summary));
 
-            // Optionally include store finalization timestamps as metadata
             if (storeFinalizationTimes != null && !storeFinalizationTimes.isEmpty()) {
-                event.put("storeFinalizationCount", storeFinalizationTimes.size());
+                attrs.put("storeFinalizationCount", storeFinalizationTimes.size());
             }
 
-            postEvents(List.of(event), "MessageTrackingResult");
+            postEvents(List.of(attrs), "MessageTrackingResult");
 
         } catch (Exception e) {
             log.warn("Failed to emit MessageTrackingResult for messageKey={}: {}",
@@ -105,35 +104,33 @@ public class NewRelicEmitService {
     }
 
     /**
-     * Emits a {@code StoreTrackingResult} event representing the state of a store
-     * at a particular completion checkpoint.
+     * Emits a {@code StoreTrackingResult} event representing the state of a store at a
+     * particular completion checkpoint.
      *
      * @param store         the store row (may be mid-tracking or final)
      * @param checkpointPct the completion percentage that triggered this event
      */
     public void emitStoreTrackingResult(MtsStore store, int checkpointPct) {
         try {
-            int expected = store.getExpectedPos() == null ? 0 : store.getExpectedPos().size();
+            int expected  = store.getExpectedPos()  == null ? 0 : store.getExpectedPos().size();
             int responded = store.getRespondedPos() == null ? 0 : store.getRespondedPos().size();
 
-            Map<String, Object> event = new LinkedHashMap<>();
-            event.put("eventType", "StoreTrackingResult");
-            event.put("messageKey", store.getMessageKey());
-            event.put("clusterId", store.getClusterId());
-            event.put("storeNumber", store.getStoreNumber());
-            event.put("locationId", store.getLocationId());
-            event.put("state", store.getState());
-            event.put("checkpointPct", checkpointPct);
-            event.put("expectedPosCount", expected);
-            event.put("respondedPosCount", responded);
-            event.put("missingPosCount", store.getMissingPos() == null ? 0 : store.getMissingPos().size());
-            event.put("inconsistencyCount", store.getInconsistencies() == null ? 0 : store.getInconsistencies().size());
-            event.put("inconsistencies", store.getInconsistencies() == null ? ""
+            Map<String, Object> attrs = new LinkedHashMap<>();
+            attrs.put("messageKey", store.getMessageKey());
+            attrs.put("clusterId", store.getClusterId());
+            attrs.put("storeNumber", store.getStoreNumber());
+            attrs.put("locationId", store.getLocationId());
+            attrs.put("state", store.getState());
+            attrs.put("checkpointPct", checkpointPct);
+            attrs.put("expectedPosCount", expected);
+            attrs.put("respondedPosCount", responded);
+            attrs.put("missingPosCount", store.getMissingPos() == null ? 0 : store.getMissingPos().size());
+            attrs.put("inconsistencyCount", store.getInconsistencies() == null ? 0 : store.getInconsistencies().size());
+            attrs.put("inconsistencies", store.getInconsistencies() == null ? ""
                     : String.join(",", store.getInconsistencies()));
-            event.put("expireAt", toEpochMillis(store.getExpireAt()));
-            event.put("timestamp", System.currentTimeMillis());
+            attrs.put("expireAt", toEpochMillis(store.getExpireAt()));
 
-            postEvents(List.of(event), "StoreTrackingResult");
+            postEvents(List.of(attrs), "StoreTrackingResult");
 
         } catch (Exception e) {
             log.warn("Failed to emit StoreTrackingResult for messageKey={} store={}: {}",
@@ -145,7 +142,7 @@ public class NewRelicEmitService {
      * Emits one {@code PosTrackingResult} event per problematic POS machine
      * (MISSING, FAILED, DELIVERED_NO_ACK).
      *
-     * Events are batched into groups of {@value #NR_BATCH_LIMIT} per POST call.
+     * Events are batched into groups of {@value #NR_BATCH_LIMIT} per send call.
      *
      * @param store            the finalized store row
      * @param firstPublishedAt timestamp of the original publish (used to compute lag)
@@ -154,35 +151,27 @@ public class NewRelicEmitService {
         try {
             List<Map<String, Object>> events = new ArrayList<>();
 
-            // Emit events for POS machines that never responded (still in missingPos)
             if (store.getMissingPos() != null) {
                 for (String posHost : store.getMissingPos()) {
-                    events.add(buildPosEvent(store, posHost, STATUS_MISSING, null, firstPublishedAt));
+                    events.add(buildPosAttrs(store, posHost, STATUS_MISSING, null, firstPublishedAt));
                 }
             }
 
-            // Emit events for POS machines that responded but with a problematic status
             if (store.getPosStatuses() != null) {
                 for (Map.Entry<String, PosStatus> entry : store.getPosStatuses().entrySet()) {
-                    String posHost = entry.getKey();
                     PosStatus ps = entry.getValue();
-                    if (ps.getStatus() == null) {
-                        continue;
-                    }
+                    if (ps.getStatus() == null) continue;
                     boolean isProblem = STATUS_FAILED.equals(ps.getStatus())
                             || STATUS_DELIVERED_NO_ACK.equals(ps.getStatus());
                     if (isProblem) {
-                        events.add(buildPosEvent(store, posHost, ps.getStatus(),
+                        events.add(buildPosAttrs(store, entry.getKey(), ps.getStatus(),
                                 ps.getPatchReceivedAt(), firstPublishedAt));
                     }
                 }
             }
 
-            if (events.isEmpty()) {
-                return;
-            }
+            if (events.isEmpty()) return;
 
-            // Batch into NR_BATCH_LIMIT-sized chunks
             for (int i = 0; i < events.size(); i += NR_BATCH_LIMIT) {
                 List<Map<String, Object>> batch = events.subList(i, Math.min(i + NR_BATCH_LIMIT, events.size()));
                 postEvents(batch, "PosTrackingResult");
@@ -195,14 +184,13 @@ public class NewRelicEmitService {
     }
 
     /**
-     * Emits a {@code MessageTrackingResult} event with state=REPLACED for the
-     * old summary that is being superseded by a re-publish.
+     * Emits a {@code MessageTrackingResult} event with state=REPLACED for the old summary
+     * that is being superseded by a re-publish.
      *
      * @param oldSummary the summary row that will be replaced
      */
     public void emitReplacedEvent(MtsSummary oldSummary) {
         try {
-            // Clone the event but force state to REPLACED
             MtsSummary replaced = MtsSummary.builder()
                     .id(oldSummary.getId())
                     .messageKey(oldSummary.getMessageKey())
@@ -234,56 +222,67 @@ public class NewRelicEmitService {
     // Private helpers
     // -----------------------------------------------------------------------
 
-    private Map<String, Object> buildPosEvent(MtsStore store,
+    private Map<String, Object> buildPosAttrs(MtsStore store,
                                                String posHost,
                                                String status,
                                                Instant patchReceivedAt,
                                                Instant firstPublishedAt) {
-        Map<String, Object> event = new LinkedHashMap<>();
-        event.put("eventType", "PosTrackingResult");
-        event.put("messageKey", store.getMessageKey());
-        event.put("clusterId", store.getClusterId());
-        event.put("storeNumber", store.getStoreNumber());
-        event.put("locationId", store.getLocationId());
-        event.put("posHostname", posHost);
-        event.put("status", status);
-        event.put("expireAt", toEpochMillis(store.getExpireAt()));
-        event.put("firstPublishedAt", toEpochMillis(firstPublishedAt));
+        Map<String, Object> attrs = new LinkedHashMap<>();
+        attrs.put("messageKey", store.getMessageKey());
+        attrs.put("clusterId", store.getClusterId());
+        attrs.put("storeNumber", store.getStoreNumber());
+        attrs.put("locationId", store.getLocationId());
+        attrs.put("posHostname", posHost);
+        attrs.put("status", status);
+        attrs.put("expireAt", toEpochMillis(store.getExpireAt()));
+        attrs.put("firstPublishedAt", toEpochMillis(firstPublishedAt));
 
         if (patchReceivedAt != null && firstPublishedAt != null) {
-            long lagMs = ChronoUnit.MILLIS.between(firstPublishedAt, patchReceivedAt);
-            event.put("responselagMs", lagMs);
+            attrs.put("responselagMs", ChronoUnit.MILLIS.between(firstPublishedAt, patchReceivedAt));
         }
 
-        event.put("timestamp", System.currentTimeMillis());
-        return event;
+        return attrs;
     }
 
     /**
-     * Serializes the event list to JSON and POSTs to the NR Events API.
-     * Uses a blocking reactive call — acceptable because this is fire-and-forget on a
-     * background thread and NR calls should complete quickly.
-     *
-     * @param events    list of event maps to POST
-     * @param eventType label used only for logging
+     * Converts attribute maps to NR SDK {@link Event} objects and sends them as a batch.
+     * All exceptions are swallowed — telemetry must never disrupt the core tracking logic.
      */
-    private void postEvents(List<Map<String, Object>> events, String eventType) {
-        if (events == null || events.isEmpty()) {
-            return;
-        }
+    private void postEvents(List<Map<String, Object>> attrMaps, String eventType) {
+        if (attrMaps == null || attrMaps.isEmpty()) return;
         try {
-            String payload = objectMapper.writeValueAsString(events);
-
-            HttpRequest<String> request = HttpRequest.POST(eventsUrl, payload)
-                    .contentType(MediaType.APPLICATION_JSON_TYPE)
-                    .header("X-Insert-Key", apiKey);
-
-            HttpResponse<String> response = httpClient.toBlocking().exchange(request, String.class);
-            log.info("NR {} POST status={} events={}", eventType, response.getStatus().getCode(), events.size());
+            long now = System.currentTimeMillis();
+            List<Event> events = new ArrayList<>(attrMaps.size());
+            for (Map<String, Object> map : attrMaps) {
+                events.add(new Event(eventType, toAttributes(map), now));
+            }
+            EventBatch batch = new EventBatch(events, new Attributes());
+            eventBatchSender.sendBatch(batch);
+            log.info("NR {} sent events={}", eventType, events.size());
 
         } catch (Exception e) {
-            log.warn("NR POST failed for eventType={} events={}: {}", eventType, events.size(), e.getMessage());
+            log.warn("NR send failed for eventType={} events={}: {}", eventType, attrMaps.size(), e.getMessage());
         }
+    }
+
+    /**
+     * Converts a plain {@code Map<String, Object>} to an NR {@link Attributes} instance.
+     * Null values are skipped. Unrecognised types fall back to {@code toString()}.
+     */
+    private Attributes toAttributes(Map<String, Object> map) {
+        Attributes attrs = new Attributes();
+        for (Map.Entry<String, Object> entry : map.entrySet()) {
+            Object v = entry.getValue();
+            if (v == null) continue;
+            String k = entry.getKey();
+            if      (v instanceof String)  { attrs.put(k, (String)  v); }
+            else if (v instanceof Long)    { attrs.put(k, (Long)    v); }
+            else if (v instanceof Integer) { attrs.put(k, (long)(int)(Integer) v); }
+            else if (v instanceof Double)  { attrs.put(k, (Double)  v); }
+            else if (v instanceof Boolean) { attrs.put(k, (Boolean) v); }
+            else                           { attrs.put(k, v.toString()); }
+        }
+        return attrs;
     }
 
     private static long toEpochMillis(Instant instant) {
@@ -291,9 +290,7 @@ public class NewRelicEmitService {
     }
 
     private static long computeTrackingDuration(MtsSummary summary) {
-        if (summary.getFirstPublishedAt() == null) {
-            return 0L;
-        }
+        if (summary.getFirstPublishedAt() == null) return 0L;
         Instant end = summary.getUpdatedAt() != null ? summary.getUpdatedAt() : Instant.now();
         return ChronoUnit.MILLIS.between(summary.getFirstPublishedAt(), end);
     }

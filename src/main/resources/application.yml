@@ -1,0 +1,36 @@
+micronaut:
+  application:
+    name: inconsistency-service
+  server:
+    port: 8090
+  executors:
+    scheduled:
+      type: scheduled
+      core-pool-size: 2
+
+datasources:
+  default:
+    url: ${DB_URL:`jdbc:postgresql://localhost:5432/aq_registry_ppe`}
+    username: ${DB_USER:`postgres`}
+    password: ${DB_PASSWORD:`postgres`}
+    driver-class-name: org.postgresql.Driver
+    maximum-pool-size: 20
+    minimum-idle: 5
+    schema-generate: NONE
+    dialect: POSTGRES
+
+flyway:
+  datasources:
+    default:
+      enabled: true
+      locations: classpath:db/migration
+
+newrelic:
+  account-id: ${NR_ACCOUNT_ID:`0`}
+  api-key: ${NR_INSERT_KEY:`changeme`}
+  events-url: https://insights-collector.newrelic.com/v1/accounts/${newrelic.account-id}/events
+
+inconsistency:
+  late-pos-threshold-minutes: 60
+  checkpoint-thresholds: 1,50,100
+  cleanup-batch-size: 500

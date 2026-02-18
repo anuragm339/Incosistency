@@ -37,6 +37,9 @@ public class CleanupScheduler {
     @Value("${inconsistency.cleanup-batch-size:500}")
     private int batchSize;
 
+    @Value("${inconsistency.finalizing-stale-minutes:5}")
+    private int finalizingStaleMinutes;
+
     @Inject
     private MtsStoreRepository storeRepository;
 
@@ -62,6 +65,19 @@ public class CleanupScheduler {
         Instant now = Instant.now();
         log.info("CleanupScheduler starting — looking for expired active rows before={} limit={}", now, batchSize);
 
+        List<MtsStore> staleFinalizing;
+        try {
+            staleFinalizing = storeRepository.findStaleFinalizing(finalizingStaleMinutes, batchSize);
+        } catch (Exception e) {
+            log.error("CleanupScheduler failed to query stale FINALIZING rows: {}", e.getMessage(), e);
+            staleFinalizing = List.of();
+        }
+
+        if (!staleFinalizing.isEmpty()) {
+            log.info("CleanupScheduler found {} stale FINALIZING rows to process", staleFinalizing.size());
+            finalizeBatch(staleFinalizing);
+        }
+
         List<MtsStore> expiredStores;
         try {
             expiredStores = storeRepository.findExpiredActive(now, batchSize);
@@ -76,11 +92,14 @@ public class CleanupScheduler {
         }
 
         log.info("CleanupScheduler found {} expired active rows to process", expiredStores.size());
+        finalizeBatch(expiredStores);
+    }
 
+    private void finalizeBatch(List<MtsStore> stores) {
         int succeeded = 0;
         int failed = 0;
 
-        for (MtsStore store : expiredStores) {
+        for (MtsStore store : stores) {
             try {
                 log.info("CleanupScheduler finalizing messageKey={} store={} expireAt={}",
                         store.getMessageKey(), store.getStoreNumber(), store.getExpireAt());
@@ -95,6 +114,6 @@ public class CleanupScheduler {
         }
 
         log.info("CleanupScheduler completed batch: succeeded={} failed={} total={}",
-                succeeded, failed, expiredStores.size());
+                succeeded, failed, stores.size());
     }
 }

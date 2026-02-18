@@ -82,6 +82,84 @@ public class MtsSummaryRepository {
     // -----------------------------------------------------------------------
 
     /**
+     * Inserts a new summary row using the provided connection (supports transactional use).
+     *
+     * @param conn    active JDBC connection (may be within a transaction)
+     * @param summary the summary to persist (id field will be populated on return)
+     * @return the saved summary with its database-generated id
+     */
+    public MtsSummary save(Connection conn, MtsSummary summary) {
+        final String sql = """
+                INSERT INTO mts_summary
+                    (message_key, cluster_id, msg_offset,
+                     first_published_at, last_published_at, expire_at,
+                     total_stores, stores_done, stores_partial, stores_timed_out,
+                     publish_count, state, inconsistencies,
+                     created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?::jsonb, NOW(), NOW())
+                RETURNING id, created_at, updated_at
+                """;
+
+        try (PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setString(1, summary.getMessageKey());
+            ps.setString(2, summary.getClusterId());
+            setNullableLong(ps, 3, summary.getMsgOffset());
+            ps.setTimestamp(4, toTimestamp(summary.getFirstPublishedAt()));
+            ps.setTimestamp(5, toTimestamp(summary.getLastPublishedAt()));
+            ps.setTimestamp(6, toTimestamp(summary.getExpireAt()));
+            ps.setInt(7, summary.getTotalStores());
+            ps.setInt(8, summary.getStoresDone());
+            ps.setInt(9, summary.getStoresPartial());
+            ps.setInt(10, summary.getStoresTimedOut());
+            ps.setInt(11, summary.getPublishCount());
+            ps.setString(12, summary.getState());
+            ps.setString(13, serializeList(summary.getInconsistencies()));
+
+            try (ResultSet rs = ps.executeQuery()) {
+                if (rs.next()) {
+                    summary.setId(rs.getLong("id"));
+                    summary.setCreatedAt(toInstant(rs.getTimestamp("created_at")));
+                    summary.setUpdatedAt(toInstant(rs.getTimestamp("updated_at")));
+                }
+            }
+            log.info("Saved mts_summary id={} messageKey={}", summary.getId(), summary.getMessageKey());
+            return summary;
+        } catch (SQLException | JsonProcessingException e) {
+            log.error("Error saving mts_summary(conn) for messageKey={}", summary.getMessageKey(), e);
+            throw new RuntimeException("DB error in save(conn)", e);
+        }
+    }
+
+    /**
+     * Deletes the summary row for the given messageKey using the provided connection
+     * (supports transactional use).
+     *
+     * @param conn       active JDBC connection (may be within a transaction)
+     * @param messageKey business key to delete
+     */
+    public void delete(Connection conn, String messageKey) {
+        final String sql = "DELETE FROM mts_summary WHERE message_key = ?";
+        try (PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setString(1, messageKey);
+            int rows = ps.executeUpdate();
+            log.info("Deleted mts_summary(conn) messageKey={} rows={}", messageKey, rows);
+        } catch (SQLException e) {
+            log.error("Error in delete(conn) for messageKey={}", messageKey, e);
+            throw new RuntimeException("DB error in delete(conn)", e);
+        }
+    }
+
+    /**
+     * Returns the underlying {@link DataSource} so callers can share a single
+     * transactional connection across summary and store operations.
+     *
+     * @return the injected DataSource
+     */
+    public DataSource getDataSource() {
+        return dataSource;
+    }
+
+    /**
      * Inserts a new summary row and returns the entity with the generated id.
      *
      * @param summary the summary to persist (id field will be populated on return)
@@ -230,6 +308,25 @@ public class MtsSummaryRepository {
     }
 
     /**
+     * Transactional overload for {@link #incrementStoresDone(String)}.
+     * Uses the provided connection to participate in the caller's transaction.
+     */
+    public void incrementStoresDone(Connection conn, String messageKey) {
+        final String sql = """
+                UPDATE mts_summary
+                   SET stores_done = stores_done + 1,
+                       state = CASE
+                           WHEN (stores_done + 1 + stores_partial + stores_timed_out) >= total_stores
+                               THEN 'DONE'
+                           ELSE state
+                       END,
+                       updated_at = NOW()
+                 WHERE message_key = ?
+                """;
+        executeCounterUpdate(conn, sql, messageKey, "incrementStoresDone(conn)");
+    }
+
+    /**
      * Atomically increments {@code stores_timed_out} by 1.
      *
      * @param messageKey the message to update
@@ -242,6 +339,20 @@ public class MtsSummaryRepository {
                  WHERE message_key = ?
                 """;
         executeCounterUpdate(sql, messageKey, "incrementStoresTimedOut");
+    }
+
+    /**
+     * Transactional overload for {@link #incrementStoresTimedOut(String)}.
+     * Uses the provided connection to participate in the caller's transaction.
+     */
+    public void incrementStoresTimedOut(Connection conn, String messageKey) {
+        final String sql = """
+                UPDATE mts_summary
+                   SET stores_timed_out = stores_timed_out + 1,
+                       updated_at = NOW()
+                 WHERE message_key = ?
+                """;
+        executeCounterUpdate(conn, sql, messageKey, "incrementStoresTimedOut(conn)");
     }
 
     /**
@@ -259,6 +370,20 @@ public class MtsSummaryRepository {
         executeCounterUpdate(sql, messageKey, "incrementStoresPartial");
     }
 
+    /**
+     * Transactional overload for {@link #incrementStoresPartial(String)}.
+     * Uses the provided connection to participate in the caller's transaction.
+     */
+    public void incrementStoresPartial(Connection conn, String messageKey) {
+        final String sql = """
+                UPDATE mts_summary
+                   SET stores_partial = stores_partial + 1,
+                       updated_at = NOW()
+                 WHERE message_key = ?
+                """;
+        executeCounterUpdate(conn, sql, messageKey, "incrementStoresPartial(conn)");
+    }
+
     // -----------------------------------------------------------------------
     // Private helpers
     // -----------------------------------------------------------------------
@@ -271,6 +396,17 @@ public class MtsSummaryRepository {
             int rows = ps.executeUpdate();
             log.info("{} messageKey={} rows={}", opName, messageKey, rows);
 
+        } catch (SQLException e) {
+            log.error("Error in {} for messageKey={}", opName, messageKey, e);
+            throw new RuntimeException("DB error in " + opName, e);
+        }
+    }
+
+    private void executeCounterUpdate(Connection conn, String sql, String messageKey, String opName) {
+        try (PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setString(1, messageKey);
+            int rows = ps.executeUpdate();
+            log.info("{} messageKey={} rows={}", opName, messageKey, rows);
         } catch (SQLException e) {
             log.error("Error in {} for messageKey={}", opName, messageKey, e);
             throw new RuntimeException("DB error in " + opName, e);

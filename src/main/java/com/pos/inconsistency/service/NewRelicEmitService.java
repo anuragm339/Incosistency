@@ -21,6 +21,8 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.TimeUnit;
 
 /**
  * Fire-and-forget service that emits custom events to New Relic via the Telemetry SDK.
@@ -47,7 +49,23 @@ public class NewRelicEmitService {
     @Value("${newrelic.account-id}")
     private String accountId;
 
+    /** Number of worker threads draining the queue. Tune via NR_WORKER_THREADS env var. */
+    @Value("${newrelic.worker-threads:4}")
+    private int workerThreadCount;
+
+    /** Bounded queue capacity. Tune via NR_QUEUE_CAPACITY env var. */
+    @Value("${newrelic.queue-capacity:50000}")
+    private int queueCapacity;
+
     private EventBatchSender eventBatchSender;
+
+    /**
+     * Bounded queue of ready-to-send event batches.
+     * Initialised in {@link #init()} after config values are injected.
+     * Request threads only ever call {@link LinkedBlockingQueue#offer} — non-blocking.
+     * Worker threads drain it via {@link #drainQueue(int)}.
+     */
+    volatile LinkedBlockingQueue<EventBatch> eventQueue;
 
     @PostConstruct
     void init() {
@@ -58,6 +76,40 @@ public class NewRelicEmitService {
                 .httpPoster(new OkHttpPoster())
                 .build();
         eventBatchSender = EventBatchSender.create(config);
+
+        eventQueue = new LinkedBlockingQueue<>(queueCapacity);
+
+        for (int i = 0; i < workerThreadCount; i++) {
+            final int workerIndex = i;
+            Thread worker = new Thread(() -> drainQueue(workerIndex), "nr-emit-worker-" + i);
+            worker.setDaemon(true);
+            worker.start();
+        }
+        log.info("NR emit service started: workers={} queueCapacity={}", workerThreadCount, queueCapacity);
+    }
+
+    /**
+     * Continuously drains {@link #eventQueue}, calling {@code sendBatch} for each entry.
+     * Multiple instances run concurrently — the queue is thread-safe and distributes
+     * work across all workers automatically.
+     * Individual send failures are logged and swallowed; the loop continues.
+     */
+    private void drainQueue(int workerIndex) {
+        while (!Thread.currentThread().isInterrupted()) {
+            try {
+                EventBatch batch = eventQueue.poll(1, TimeUnit.SECONDS);
+                if (batch == null) {
+                    continue;
+                }
+                try {
+                    eventBatchSender.sendBatch(batch);
+                } catch (Exception e) {
+                    log.warn("NR worker-{} sendBatch failed: {}", workerIndex, e.getMessage());
+                }
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+            }
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -245,8 +297,10 @@ public class NewRelicEmitService {
     }
 
     /**
-     * Converts attribute maps to NR SDK {@link Event} objects and sends them as a batch.
-     * All exceptions are swallowed — telemetry must never disrupt the core tracking logic.
+     * Converts attribute maps to NR SDK {@link Event} objects and enqueues the batch
+     * for async dispatch by the worker thread.  This method is non-blocking: if the
+     * queue is full the batch is dropped with a warning rather than blocking the caller.
+     * All exceptions are swallowed — telemetry must never disrupt core tracking logic.
      */
     private void postEvents(List<Map<String, Object>> attrMaps, String eventType) {
         if (attrMaps == null || attrMaps.isEmpty()) return;
@@ -257,11 +311,15 @@ public class NewRelicEmitService {
                 events.add(new Event(eventType, toAttributes(map), now));
             }
             EventBatch batch = new EventBatch(events, new Attributes());
-            eventBatchSender.sendBatch(batch);
-            log.info("NR {} sent events={}", eventType, events.size());
-
+            boolean offered = eventQueue.offer(batch, 100, TimeUnit.MILLISECONDS);
+            if (!offered) {
+                log.error("NR event queue full — dropping {} {} events", events.size(), eventType);
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            log.warn("NR queue offer interrupted for eventType={}", eventType);
         } catch (Exception e) {
-            log.warn("NR send failed for eventType={} events={}: {}", eventType, attrMaps.size(), e.getMessage());
+            log.warn("NR queue offer failed for eventType={}: {}", eventType, e.getMessage());
         }
     }
 

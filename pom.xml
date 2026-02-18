@@ -44,10 +44,16 @@
             <artifactId>micronaut-http-server-netty</artifactId>
         </dependency>
 
-        <!-- Micronaut HTTP Client -->
+        <!-- New Relic Telemetry SDK -->
         <dependency>
-            <groupId>io.micronaut</groupId>
-            <artifactId>micronaut-http-client</artifactId>
+            <groupId>com.newrelic.telemetry</groupId>
+            <artifactId>telemetry-core</artifactId>
+            <version>0.16.0</version>
+        </dependency>
+        <dependency>
+            <groupId>com.newrelic.telemetry</groupId>
+            <artifactId>telemetry-http-okhttp</artifactId>
+            <version>0.16.0</version>
         </dependency>
 
         <!-- Micronaut Jackson Databind -->
@@ -161,6 +167,12 @@
         <dependency>
             <groupId>io.micronaut.test</groupId>
             <artifactId>micronaut-test-junit5</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.mockito</groupId>
+            <artifactId>mockito-core</artifactId>
+            <version>5.10.0</version>
             <scope>test</scope>
         </dependency>
         <dependency>

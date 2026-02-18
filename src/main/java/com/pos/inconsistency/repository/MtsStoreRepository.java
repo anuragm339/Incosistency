@@ -130,6 +130,7 @@ public class MtsStoreRepository {
      * @return list of expired-but-active store rows
      */
     public List<MtsStore> findExpiredActive(Instant before, int limit) {
+        // Returns rows that have genuinely expired and are still in PENDING or PARTIAL.
         final String sql = """
                 SELECT id, message_key, cluster_id, store_number, location_id, expire_at,
                        expected_pos, responded_pos, missing_pos, pos_statuses,
@@ -155,6 +156,44 @@ public class MtsStoreRepository {
         } catch (SQLException | JsonProcessingException e) {
             log.error("Error in findExpiredActive before={}", before, e);
             throw new RuntimeException("DB error in findExpiredActive", e);
+        }
+        return result;
+    }
+
+    /**
+     * Finds store rows that are stuck in FINALIZING for too long.
+     * Used by the cleanup scheduler to retry failed finalizations without starvation.
+     *
+     * @param staleMinutes rows with {@code updated_at} older than this qualify
+     * @param limit        maximum number of rows to return
+     * @return list of stale FINALIZING store rows
+     */
+    public List<MtsStore> findStaleFinalizing(int staleMinutes, int limit) {
+        final String sql = """
+                SELECT id, message_key, cluster_id, store_number, location_id, expire_at,
+                       expected_pos, responded_pos, missing_pos, pos_statuses,
+                       state, inconsistencies, last_checkpoint_pct, created_at, updated_at
+                  FROM mts_store
+                 WHERE state = 'FINALIZING'
+                   AND updated_at < NOW() - (? || ' minutes')::interval
+                 ORDER BY updated_at ASC
+                 LIMIT ?
+                """;
+
+        List<MtsStore> result = new ArrayList<>();
+        try (Connection conn = dataSource.getConnection();
+             PreparedStatement ps = conn.prepareStatement(sql)) {
+
+            ps.setInt(1, staleMinutes);
+            ps.setInt(2, limit);
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    result.add(mapRow(rs));
+                }
+            }
+        } catch (SQLException | JsonProcessingException e) {
+            log.error("Error in findStaleFinalizing staleMinutes={}", staleMinutes, e);
+            throw new RuntimeException("DB error in findStaleFinalizing", e);
         }
         return result;
     }
@@ -298,6 +337,24 @@ public class MtsStoreRepository {
     }
 
     /**
+     * Deletes the store row identified by (messageKey, storeNumber) using the provided
+     * connection (supports transactional use).
+     */
+    public void delete(Connection conn, String messageKey, String storeNumber) {
+        final String sql = "DELETE FROM mts_store WHERE message_key = ? AND store_number = ?";
+
+        try (PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setString(1, messageKey);
+            ps.setString(2, storeNumber);
+            int rows = ps.executeUpdate();
+            log.info("Deleted mts_store(conn) messageKey={} store={} rows={}", messageKey, storeNumber, rows);
+        } catch (SQLException e) {
+            log.error("Error deleting mts_store(conn) messageKey={} store={}", messageKey, storeNumber, e);
+            throw new RuntimeException("DB error in delete(conn)", e);
+        }
+    }
+
+    /**
      * Deletes all store rows belonging to a message key.
      * Used during re-publish (replace) scenarios.
      *
@@ -371,6 +428,122 @@ public class MtsStoreRepository {
     // -----------------------------------------------------------------------
     // DataSource accessor — used by services that need transactional control
     // -----------------------------------------------------------------------
+
+    /**
+     * Atomically transitions the store row from an active state ({@code PENDING},
+     * {@code PARTIAL}, or {@code DONE}) to {@code FINALIZING}, returning the row's
+     * current data so the caller can proceed with finalization.
+     *
+     * <p>If this method returns empty, another thread has already claimed or deleted the
+     * row — the caller must treat this as a no-op and return immediately.  This is the
+     * single-writer gate that prevents double-finalization races between
+     * {@link com.pos.inconsistency.service.MessageTrackingService#handlePosResponse}
+     * and the cleanup scheduler.
+     *
+     * @param messageKey  business message identifier
+     * @param storeNumber store number
+     * @return the claimed row with all current field values, or empty if already claimed
+     */
+    public Optional<MtsStore> claimForFinalization(String messageKey, String storeNumber) {
+        // Also re-claim rows already in FINALIZING whose updated_at is stale (> 5 min ago).
+        // This allows the cleanup scheduler to retry a finalization that previously threw
+        // after the claim was written but before the row was deleted — preventing permanent
+        // stuck rows.  Two concurrent callers can never both succeed: the second UPDATE
+        // finds updated_at already refreshed to NOW() and misses the 5-minute window.
+        final String sql = """
+                UPDATE mts_store
+                   SET state = 'FINALIZING', updated_at = NOW()
+                 WHERE message_key = ?
+                   AND store_number = ?
+                   AND (
+                         state IN ('PENDING', 'PARTIAL', 'DONE')
+                      OR (state = 'FINALIZING' AND updated_at < NOW() - INTERVAL '5 minutes')
+                   )
+                RETURNING id, message_key, cluster_id, store_number, location_id, expire_at,
+                          expected_pos, responded_pos, missing_pos, pos_statuses,
+                          state, inconsistencies, last_checkpoint_pct, created_at, updated_at
+                """;
+
+        try (Connection conn = dataSource.getConnection();
+             PreparedStatement ps = conn.prepareStatement(sql)) {
+
+            ps.setString(1, messageKey);
+            ps.setString(2, storeNumber);
+            try (ResultSet rs = ps.executeQuery()) {
+                if (rs.next()) {
+                    return Optional.of(mapRow(rs));
+                }
+            }
+        } catch (SQLException | JsonProcessingException e) {
+            log.error("Error in claimForFinalization messageKey={} store={}", messageKey, storeNumber, e);
+            throw new RuntimeException("DB error in claimForFinalization", e);
+        }
+        return Optional.empty();
+    }
+
+    /**
+     * Batch-inserts store rows using the provided connection (supports transactional use).
+     *
+     * @param conn   active JDBC connection (may be within a transaction)
+     * @param stores list of store rows to insert
+     */
+    public void saveAll(Connection conn, List<MtsStore> stores) {
+        if (stores == null || stores.isEmpty()) {
+            return;
+        }
+
+        final String sql = """
+                INSERT INTO mts_store
+                    (message_key, cluster_id, store_number, location_id, expire_at,
+                     expected_pos, responded_pos, missing_pos, pos_statuses,
+                     state, inconsistencies, last_checkpoint_pct,
+                     created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?::jsonb, ?::jsonb, ?::jsonb, ?::jsonb, ?, ?::jsonb, ?, NOW(), NOW())
+                """;
+
+        try (PreparedStatement ps = conn.prepareStatement(sql)) {
+            for (MtsStore store : stores) {
+                ps.setString(1, store.getMessageKey());
+                ps.setString(2, store.getClusterId());
+                ps.setString(3, store.getStoreNumber());
+                setNullableString(ps, 4, store.getLocationId());
+                ps.setTimestamp(5, toTimestamp(store.getExpireAt()));
+                ps.setString(6, serializeList(store.getExpectedPos()));
+                ps.setString(7, serializeList(store.getRespondedPos()));
+                ps.setString(8, serializeList(store.getMissingPos()));
+                ps.setString(9, serializePosStatuses(store.getPosStatuses()));
+                ps.setString(10, store.getState());
+                ps.setString(11, serializeList(store.getInconsistencies()));
+                ps.setInt(12, store.getLastCheckpointPct());
+                ps.addBatch();
+            }
+            ps.executeBatch();
+            log.info("Batch-inserted {} mts_store rows for messageKey={}", stores.size(),
+                    stores.getFirst().getMessageKey());
+        } catch (SQLException | JsonProcessingException e) {
+            log.error("Error in saveAll(conn) for {} stores", stores.size(), e);
+            throw new RuntimeException("DB error in saveAll(conn)", e);
+        }
+    }
+
+    /**
+     * Deletes all store rows for a message key using the provided connection
+     * (supports transactional use).
+     *
+     * @param conn       active JDBC connection (may be within a transaction)
+     * @param messageKey business message identifier
+     */
+    public void deleteAllByMessageKey(Connection conn, String messageKey) {
+        final String sql = "DELETE FROM mts_store WHERE message_key = ?";
+        try (PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setString(1, messageKey);
+            int rows = ps.executeUpdate();
+            log.info("Deleted all mts_store rows messageKey={} rows={}", messageKey, rows);
+        } catch (SQLException e) {
+            log.error("Error in deleteAllByMessageKey(conn) for messageKey={}", messageKey, e);
+            throw new RuntimeException("DB error in deleteAllByMessageKey(conn)", e);
+        }
+    }
 
     /**
      * Returns the underlying {@link DataSource} so that callers can open a

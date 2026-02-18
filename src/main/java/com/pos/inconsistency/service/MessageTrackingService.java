@@ -42,12 +42,13 @@ public class MessageTrackingService {
     private static final Logger log = LoggerFactory.getLogger(MessageTrackingService.class);
 
     // State constants
-    private static final String STATE_PENDING   = "PENDING";
-    private static final String STATE_PARTIAL   = "PARTIAL";
-    private static final String STATE_DONE      = "DONE";
-    private static final String STATE_TIMED_OUT = "TIMED_OUT";
-    private static final String STATE_DEGRADED  = "DEGRADED";
-    private static final String STATE_REPLACED  = "REPLACED";
+    private static final String STATE_PENDING    = "PENDING";
+    private static final String STATE_PARTIAL    = "PARTIAL";
+    private static final String STATE_DONE       = "DONE";
+    private static final String STATE_FINALIZING = "FINALIZING";
+    private static final String STATE_TIMED_OUT  = "TIMED_OUT";
+    private static final String STATE_DEGRADED   = "DEGRADED";
+    private static final String STATE_REPLACED   = "REPLACED";
 
     // POS status constants (mirrored from domain)
     private static final String STATUS_DONE             = "DONE";
@@ -101,6 +102,7 @@ public class MessageTrackingService {
         Optional<MtsSummary> existing = summaryRepo.findByMessageKey(event.messageKey());
 
         List<String> inconsistencies = new ArrayList<>();
+        Instant now = Instant.now();
 
         if (existing.isPresent()) {
             MtsSummary old = existing.get();
@@ -110,6 +112,13 @@ public class MessageTrackingService {
             // Always flag a duplicate key on re-publish
             inconsistencies.add(InconsistencyType.DUPLICATE_KEY.name());
 
+            // Premature re-publish: previous tracking window still open
+            if (old.getExpireAt() != null && old.getExpireAt().isAfter(now)) {
+                log.warn("PREMATURE_REPUBLISH for messageKey={} — previous window still open until {}",
+                        event.messageKey(), old.getExpireAt());
+                inconsistencies.add(InconsistencyType.PREMATURE_REPUBLISH.name());
+            }
+
             // Offset mismatch if the Kafka offset changed
             if (old.getMsgOffset() != null && !old.getMsgOffset().equals(event.msgOffset())) {
                 log.warn("OFFSET_MISMATCH for messageKey={} old={} new={}",
@@ -117,16 +126,9 @@ public class MessageTrackingService {
                 inconsistencies.add(InconsistencyType.OFFSET_MISMATCH.name());
             }
 
-            // Emit REPLACED event for the superseded summary
-            nrEmitService.emitReplacedEvent(old);
-
-            // Remove old data
-            storeRepo.deleteAllByMessageKey(event.messageKey());
-            summaryRepo.delete(event.messageKey());
         }
 
-        // Build and persist the summary
-        Instant now = Instant.now();
+        // Build the new summary row
         MtsSummary summary = MtsSummary.builder()
                 .messageKey(event.messageKey())
                 .clusterId(event.clusterId())
@@ -143,15 +145,13 @@ public class MessageTrackingService {
                 .inconsistencies(inconsistencies)
                 .build();
 
-        summaryRepo.save(summary);
-
         // Build store rows
         List<MtsStore> storeRows = new ArrayList<>();
         for (StoreDetail detail : event.stores()) {
             List<String> expectedPos = detail.expectedPosHosts() == null
                     ? new ArrayList<>() : new ArrayList<>(detail.expectedPosHosts());
 
-            MtsStore store = MtsStore.builder()
+            storeRows.add(MtsStore.builder()
                     .messageKey(event.messageKey())
                     .clusterId(event.clusterId())
                     .storeNumber(detail.storeNumber())
@@ -164,14 +164,38 @@ public class MessageTrackingService {
                     .state(STATE_PENDING)
                     .inconsistencies(new ArrayList<>())
                     .lastCheckpointPct(0)
-                    .build();
-            storeRows.add(store);
+                    .build());
         }
 
-        storeRepo.saveAll(storeRows);
+        // Persist summary + store rows in a single transaction to avoid partial writes
+        try (Connection conn = storeRepo.getDataSource().getConnection()) {
+            conn.setAutoCommit(false);
+            try {
+                if (existing.isPresent()) {
+                    storeRepo.deleteAllByMessageKey(conn, event.messageKey());
+                    summaryRepo.delete(conn, event.messageKey());
+                }
+                summaryRepo.save(conn, summary);
+                storeRepo.saveAll(conn, storeRows);
+                conn.commit();
 
-        log.info("Publish handled messageKey={} totalStores={} duplicate={}",
-                event.messageKey(), storeRows.size(), !inconsistencies.isEmpty());
+                // Emit REPLACED only after the replacement is durably committed.
+                // Emitting before commit would send the event even if the transaction
+                // rolls back, creating a phantom REPLACED record in New Relic.
+                if (existing.isPresent()) {
+                    nrEmitService.emitReplacedEvent(existing.get());
+                }
+            } catch (Exception e) {
+                conn.rollback();
+                throw e;
+            }
+        } catch (SQLException e) {
+            log.error("DB connection error in handlePublish messageKey={}", event.messageKey(), e);
+            throw new RuntimeException("DB connection error in handlePublish", e);
+        }
+
+        log.info("Publish handled messageKey={} totalStores={} inconsistencies={}",
+                event.messageKey(), storeRows.size(), inconsistencies);
     }
 
     // -----------------------------------------------------------------------
@@ -224,6 +248,20 @@ public class MessageTrackingService {
                 }
 
                 MtsStore store = lockedOpt.get();
+
+                // Reject responses for rows that are already in a terminal or in-progress
+                // finalization state.  FINALIZING means claimForFinalization already wrote
+                // the claim; DONE means all POS responded and finalization is about to run;
+                // TIMED_OUT means the cleanup path already finalized the row.
+                // Mutating these rows would corrupt data that finalization has already "frozen".
+                if (STATE_FINALIZING.equals(store.getState())
+                        || STATE_DONE.equals(store.getState())
+                        || STATE_TIMED_OUT.equals(store.getState())) {
+                    log.info("Late POS response ignored — store is in terminal state {} messageKey={} store={} pos={}",
+                            store.getState(), messageKey, event.storeNumber(), event.posHostname());
+                    conn.rollback();
+                    return;
+                }
 
                 // Fetch the summary to get firstPublishedAt (needed for lag check)
                 Optional<MtsSummary> summaryOpt = summaryRepo.findByMessageKey(messageKey);
@@ -363,62 +401,97 @@ public class MessageTrackingService {
         log.info("finalizeStore messageKey={} store={} currentState={}",
                 store.getMessageKey(), store.getStoreNumber(), store.getState());
 
+        // ---- Idempotency guard -------------------------------------------------
+        // Atomically claim the row by moving it to FINALIZING.  If another thread
+        // (handlePosResponse or the cleanup scheduler) already claimed it, we get
+        // empty back and must return immediately to avoid double-counting counters
+        // or emitting duplicate NR events.
+        Optional<MtsStore> claimed = storeRepo.claimForFinalization(
+                store.getMessageKey(), store.getStoreNumber());
+
+        if (claimed.isEmpty()) {
+            log.info("finalizeStore skipped — row already claimed or deleted messageKey={} store={}",
+                    store.getMessageKey(), store.getStoreNumber());
+            return;
+        }
+
+        // Use the freshly claimed row (current DB state, not the stale caller snapshot)
+        MtsStore current = claimed.get();
+
         // Fetch summary for firstPublishedAt
-        Optional<MtsSummary> summaryOpt = summaryRepo.findByMessageKey(store.getMessageKey());
+        Optional<MtsSummary> summaryOpt = summaryRepo.findByMessageKey(current.getMessageKey());
         Instant firstPublishedAt = summaryOpt
                 .map(MtsSummary::getFirstPublishedAt)
-                .orElse(store.getCreatedAt());
+                .orElse(current.getCreatedAt());
 
         // Detect store-level inconsistencies
         List<InconsistencyType> detected = detectionService.detectForStore(
-                store, firstPublishedAt, latePosThresholdMinutes);
+                current, firstPublishedAt, latePosThresholdMinutes);
 
         // Merge newly detected inconsistencies (don't add duplicates)
-        if (store.getInconsistencies() == null) {
-            store.setInconsistencies(new ArrayList<>());
+        if (current.getInconsistencies() == null) {
+            current.setInconsistencies(new ArrayList<>());
         }
         for (InconsistencyType type : detected) {
             String typeName = type.name();
-            if (!store.getInconsistencies().contains(typeName)) {
-                store.setInconsistencies(new ArrayList<>(store.getInconsistencies()));
-                store.getInconsistencies().add(typeName);
+            if (!current.getInconsistencies().contains(typeName)) {
+                current.setInconsistencies(new ArrayList<>(current.getInconsistencies()));
+                current.getInconsistencies().add(typeName);
             }
         }
 
-        // Set final state
-        boolean timedOut = store.getExpireAt() != null && Instant.now().isAfter(store.getExpireAt())
-                && !STATE_DONE.equals(store.getState());
+        // Determine final state.
+        // A store is timed-out when it expired with POS machines still missing.
+        // This avoids depending on the pre-claim state value (which is now FINALIZING).
+        boolean hasMissingPos = current.getMissingPos() != null && !current.getMissingPos().isEmpty();
+        boolean expired = current.getExpireAt() != null && Instant.now().isAfter(current.getExpireAt());
+        boolean timedOut = expired && hasMissingPos;
 
         String finalState = timedOut ? STATE_TIMED_OUT : STATE_DONE;
-        store.setState(finalState);
+        current.setState(finalState);
 
         log.info("Finalizing store messageKey={} store={} finalState={} inconsistencies={}",
-                store.getMessageKey(), store.getStoreNumber(), finalState, store.getInconsistencies());
+                current.getMessageKey(), current.getStoreNumber(), finalState, current.getInconsistencies());
 
-        // Emit NR events
-        nrEmitService.emitStoreTrackingResult(store, 100);
-        nrEmitService.emitPosTrackingResults(store, firstPublishedAt);
+        // ---- NR events ---------------------------------------------------------
+        // Emit 100% checkpoint only if it was not already emitted by handlePosResponse.
+        // handlePosResponse emits and persists lastCheckpointPct=100 before calling
+        // finalizeStore, so we skip here to avoid the duplicate event.
+        if (current.getLastCheckpointPct() < 100) {
+            nrEmitService.emitStoreTrackingResult(current, 100);
+        }
+        nrEmitService.emitPosTrackingResults(current, firstPublishedAt);
 
-        // Update summary counters
-        if (STATE_TIMED_OUT.equals(finalState)) {
-            summaryRepo.incrementStoresTimedOut(store.getMessageKey());
-        } else {
-            // Distinguish DONE from PARTIAL based on whether all POS responded
-            boolean allPosResponded = store.getMissingPos() == null || store.getMissingPos().isEmpty();
-            if (allPosResponded) {
-                summaryRepo.incrementStoresDone(store.getMessageKey());
-            } else {
-                summaryRepo.incrementStoresPartial(store.getMessageKey());
+        // Update summary counters + delete store row in a single transaction
+        try (Connection conn = storeRepo.getDataSource().getConnection()) {
+            conn.setAutoCommit(false);
+            try {
+                if (STATE_TIMED_OUT.equals(finalState)) {
+                    summaryRepo.incrementStoresTimedOut(conn, current.getMessageKey());
+                } else {
+                    if (!hasMissingPos) {
+                        summaryRepo.incrementStoresDone(conn, current.getMessageKey());
+                    } else {
+                        summaryRepo.incrementStoresPartial(conn, current.getMessageKey());
+                    }
+                }
+                storeRepo.delete(conn, current.getMessageKey(), current.getStoreNumber());
+                conn.commit();
+            } catch (Exception e) {
+                conn.rollback();
+                throw e;
             }
+        } catch (SQLException e) {
+            log.error("DB error in finalizeStore counters+delete messageKey={} store={}",
+                    current.getMessageKey(), current.getStoreNumber(), e);
+            throw new RuntimeException("DB error in finalizeStore counters+delete", e);
         }
 
-        // Delete the store row
-        storeRepo.delete(store.getMessageKey(), store.getStoreNumber());
-
         // Re-fetch summary to check if all stores are now finalized
-        Optional<MtsSummary> refreshedSummaryOpt = summaryRepo.findByMessageKey(store.getMessageKey());
+        Optional<MtsSummary> refreshedSummaryOpt = summaryRepo.findByMessageKey(current.getMessageKey());
         if (refreshedSummaryOpt.isEmpty()) {
-            log.info("Summary already gone for messageKey={} — skipping message finalization", store.getMessageKey());
+            log.info("Summary already gone for messageKey={} — skipping message finalization",
+                    current.getMessageKey());
             return;
         }
 
@@ -428,7 +501,7 @@ public class MessageTrackingService {
                 + refreshedSummary.getStoresTimedOut();
 
         log.info("Store finalized messageKey={} finalized={} total={}",
-                store.getMessageKey(), finalized, refreshedSummary.getTotalStores());
+                current.getMessageKey(), finalized, refreshedSummary.getTotalStores());
 
         if (finalized >= refreshedSummary.getTotalStores()) {
             finalizeMessage(refreshedSummary);

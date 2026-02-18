@@ -28,9 +28,11 @@ flyway:
 newrelic:
   account-id: ${NR_ACCOUNT_ID:`0`}
   api-key: ${NR_INSERT_KEY:`changeme`}
-  events-url: https://insights-collector.newrelic.com/v1/accounts/${newrelic.account-id}/events
+  worker-threads: ${NR_WORKER_THREADS:`4`}
+  queue-capacity: ${NR_QUEUE_CAPACITY:`50000`}
 
 inconsistency:
   late-pos-threshold-minutes: 60
   checkpoint-thresholds: 1,50,100
   cleanup-batch-size: 500
+  finalizing-stale-minutes: 5

@@ -77,6 +77,46 @@ public class MtsSummaryRepository {
         return Optional.empty();
     }
 
+    /**
+     * Finds summary rows that are stuck in FINALIZING for too long.
+     * Used by the cleanup scheduler to retry failed message finalizations.
+     *
+     * @param staleMinutes rows with {@code updated_at} older than this qualify
+     * @param limit        maximum number of rows to return
+     * @return list of stale FINALIZING summary rows, oldest first
+     */
+    public List<MtsSummary> findStaleFinalizing(int staleMinutes, int limit) {
+        final String sql = """
+                SELECT id, message_key, cluster_id, msg_offset,
+                       first_published_at, last_published_at, expire_at,
+                       total_stores, stores_done, stores_partial, stores_timed_out,
+                       publish_count, state, inconsistencies,
+                       created_at, updated_at
+                  FROM mts_summary
+                 WHERE state = 'FINALIZING'
+                   AND updated_at < NOW() - (? || ' minutes')::interval
+                 ORDER BY updated_at ASC
+                 LIMIT ?
+                """;
+
+        List<MtsSummary> result = new ArrayList<>();
+        try (Connection conn = dataSource.getConnection();
+             PreparedStatement ps = conn.prepareStatement(sql)) {
+
+            ps.setInt(1, staleMinutes);
+            ps.setInt(2, limit);
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    result.add(mapRow(rs));
+                }
+            }
+        } catch (SQLException | JsonProcessingException e) {
+            log.error("Error in findStaleFinalizing staleMinutes={}", staleMinutes, e);
+            throw new RuntimeException("DB error in findStaleFinalizing", e);
+        }
+        return result;
+    }
+
     // -----------------------------------------------------------------------
     // Write operations
     // -----------------------------------------------------------------------
@@ -280,6 +320,49 @@ public class MtsSummaryRepository {
             log.error("Error deleting mts_summary for messageKey={}", messageKey, e);
             throw new RuntimeException("DB error in delete", e);
         }
+    }
+
+    /**
+     * Atomically transitions the summary row to FINALIZING and returns it.
+     * If another thread already claimed the row, returns empty.
+     *
+     * <p>Stale FINALIZING rows (updated_at older than {@code staleMinutes}) are also
+     * re-claimable. This allows the cleanup scheduler to retry a finalization that
+     * previously threw after the claim was written but before the row was deleted.
+     * Two concurrent callers cannot both succeed: the second UPDATE finds updated_at
+     * already refreshed to NOW() and misses the staleness window.
+     */
+    public Optional<MtsSummary> claimForFinalization(String messageKey, int staleMinutes) {
+        final String sql = """
+                UPDATE mts_summary
+                   SET state = 'FINALIZING', updated_at = NOW()
+                 WHERE message_key = ?
+                   AND (
+                         state <> 'FINALIZING'
+                      OR (state = 'FINALIZING' AND updated_at < NOW() - (? || ' minutes')::interval)
+                       )
+                RETURNING id, message_key, cluster_id, msg_offset,
+                          first_published_at, last_published_at, expire_at,
+                          total_stores, stores_done, stores_partial, stores_timed_out,
+                          publish_count, state, inconsistencies,
+                          created_at, updated_at
+                """;
+
+        try (Connection conn = dataSource.getConnection();
+             PreparedStatement ps = conn.prepareStatement(sql)) {
+
+            ps.setString(1, messageKey);
+            ps.setInt(2, staleMinutes);
+            try (ResultSet rs = ps.executeQuery()) {
+                if (rs.next()) {
+                    return Optional.of(mapRow(rs));
+                }
+            }
+        } catch (SQLException | JsonProcessingException e) {
+            log.error("Error in claimForFinalization messageKey={}", messageKey, e);
+            throw new RuntimeException("DB error in claimForFinalization", e);
+        }
+        return Optional.empty();
     }
 
     // -----------------------------------------------------------------------

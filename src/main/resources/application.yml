@@ -29,7 +29,7 @@ newrelic:
   account-id: ${NR_ACCOUNT_ID:`0`}
   api-key: ${NR_INSERT_KEY:`changeme`}
   worker-threads: ${NR_WORKER_THREADS:`4`}
-  queue-capacity: ${NR_QUEUE_CAPACITY:`50000`}
+  queue-capacity: ${NR_QUEUE_CAPACITY:`10000`}
 
 inconsistency:
   late-pos-threshold-minutes: 60

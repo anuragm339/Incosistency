@@ -75,6 +75,9 @@ public class MessageTrackingService {
     @Value("${inconsistency.checkpoint-thresholds:1,50,100}")
     private String checkpointThresholdsConfig;
 
+    @Value("${inconsistency.finalizing-stale-minutes:5}")
+    private int finalizingStaleMinutes;
+
     // Parsed checkpoint percentages; populated lazily
     private volatile int[] checkpointThresholds;
 
@@ -453,15 +456,6 @@ public class MessageTrackingService {
         log.info("Finalizing store messageKey={} store={} finalState={} inconsistencies={}",
                 current.getMessageKey(), current.getStoreNumber(), finalState, current.getInconsistencies());
 
-        // ---- NR events ---------------------------------------------------------
-        // Emit 100% checkpoint only if it was not already emitted by handlePosResponse.
-        // handlePosResponse emits and persists lastCheckpointPct=100 before calling
-        // finalizeStore, so we skip here to avoid the duplicate event.
-        if (current.getLastCheckpointPct() < 100) {
-            nrEmitService.emitStoreTrackingResult(current, 100);
-        }
-        nrEmitService.emitPosTrackingResults(current, firstPublishedAt);
-
         // Update summary counters + delete store row in a single transaction
         try (Connection conn = storeRepo.getDataSource().getConnection()) {
             conn.setAutoCommit(false);
@@ -486,6 +480,14 @@ public class MessageTrackingService {
                     current.getMessageKey(), current.getStoreNumber(), e);
             throw new RuntimeException("DB error in finalizeStore counters+delete", e);
         }
+
+        // ---- NR events ---------------------------------------------------------
+        // Emit after commit so retries don't duplicate events.
+        // Emit 100% checkpoint only if it was not already emitted by handlePosResponse.
+        if (current.getLastCheckpointPct() < 100) {
+            nrEmitService.emitStoreTrackingResult(current, 100);
+        }
+        nrEmitService.emitPosTrackingResults(current, firstPublishedAt);
 
         // Re-fetch summary to check if all stores are now finalized
         Optional<MtsSummary> refreshedSummaryOpt = summaryRepo.findByMessageKey(current.getMessageKey());
@@ -531,6 +533,17 @@ public class MessageTrackingService {
                 summary.getMessageKey(), summary.getTotalStores(),
                 summary.getStoresDone(), summary.getStoresPartial(), summary.getStoresTimedOut());
 
+        Optional<MtsSummary> claimedOpt = summaryRepo.claimForFinalization(
+                summary.getMessageKey(), finalizingStaleMinutes);
+        if (claimedOpt.isEmpty()) {
+            log.info("finalizeMessage skipped — already claimed or deleted messageKey={}",
+                    summary.getMessageKey());
+            return;
+        }
+
+        // Use the claimed row (current DB state)
+        summary = claimedOpt.get();
+
         // Detect message-level inconsistencies
         List<InconsistencyType> detected = detectionService.detectForMessage(summary);
 
@@ -559,7 +572,14 @@ public class MessageTrackingService {
         log.info("Finalizing message messageKey={} finalState={} inconsistencies={}",
                 summary.getMessageKey(), finalState, summary.getInconsistencies());
 
-        // Emit NR event before deletion
+        // Emit NR event before deleting the summary row.
+        // Ordering rationale:
+        //   emit-then-delete: if delete fails, the row stays FINALIZING and the cleanup
+        //     scheduler retries. On retry, the event may fire again (at-most-twice).
+        //   delete-then-emit: if the NR queue is full on emit, the event is permanently
+        //     lost because the row is already gone and no retry path exists.
+        // Note: if the NR queue is full at emit time, the event can still be dropped
+        // even with emit-then-delete (at-most-once under NR saturation).
         nrEmitService.emitMessageTrackingResult(summary, Map.of());
 
         // Delete the summary row

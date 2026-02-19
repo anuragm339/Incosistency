@@ -1,6 +1,8 @@
 package com.pos.inconsistency.scheduler;
 
+import com.pos.inconsistency.model.MtsSummary;
 import com.pos.inconsistency.model.MtsStore;
+import com.pos.inconsistency.repository.MtsSummaryRepository;
 import com.pos.inconsistency.repository.MtsStoreRepository;
 import com.pos.inconsistency.service.MessageTrackingService;
 import io.micronaut.context.annotation.Value;
@@ -41,6 +43,9 @@ public class CleanupScheduler {
     private int finalizingStaleMinutes;
 
     @Inject
+    private MtsSummaryRepository summaryRepository;
+
+    @Inject
     private MtsStoreRepository storeRepository;
 
     @Inject
@@ -65,6 +70,38 @@ public class CleanupScheduler {
         Instant now = Instant.now();
         log.info("CleanupScheduler starting — looking for expired active rows before={} limit={}", now, batchSize);
 
+        // ---- Pass 0: retry stale FINALIZING summary rows -------------------------
+        // If finalizeMessage claimed a summary row but then failed (e.g. transient DB
+        // error on delete), the row stays FINALIZING with no other code path to retry
+        // it.  This pass re-triggers finalizeMessage for any summary stuck > 5 min.
+        List<MtsSummary> staleFinalizingSummaries;
+        try {
+            staleFinalizingSummaries = summaryRepository.findStaleFinalizing(finalizingStaleMinutes, batchSize);
+        } catch (Exception e) {
+            log.error("CleanupScheduler failed to query stale FINALIZING summaries: {}", e.getMessage(), e);
+            staleFinalizingSummaries = List.of();
+        }
+
+        if (!staleFinalizingSummaries.isEmpty()) {
+            log.info("CleanupScheduler found {} stale FINALIZING summaries to retry", staleFinalizingSummaries.size());
+            int succeeded = 0;
+            int failed = 0;
+            for (MtsSummary summary : staleFinalizingSummaries) {
+                try {
+                    log.info("CleanupScheduler retrying finalizeMessage messageKey={}", summary.getMessageKey());
+                    messageTrackingService.finalizeMessage(summary);
+                    succeeded++;
+                } catch (Exception e) {
+                    failed++;
+                    log.error("CleanupScheduler failed to retry finalizeMessage messageKey={}: {}",
+                            summary.getMessageKey(), e.getMessage(), e);
+                }
+            }
+            log.info("CleanupScheduler summary retry batch: succeeded={} failed={} total={}",
+                    succeeded, failed, staleFinalizingSummaries.size());
+        }
+
+        // ---- Pass 1: stale FINALIZING store rows ---------------------------------
         List<MtsStore> staleFinalizing;
         try {
             staleFinalizing = storeRepository.findStaleFinalizing(finalizingStaleMinutes, batchSize);
